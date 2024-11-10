@@ -43,7 +43,7 @@ int num_queued_tasks = 0; // Total tasks created
 int tasks_remaining = 0; // Count of tasks remaining. Used for tracking in main thread and joining in order
 
 volatile int stop_running = 0; // Flag to stop threads 
-volatile int pause_running = 0; // Flag to pause threads 
+// volatile int pause_running = 0; // Flag to pause threads 
 
 void encode(struct stat sb, char *addr, char *buffer, char *cur, int *len, unsigned int *count){
     for(size_t i = 0; i < (size_t)sb.st_size; i++){
@@ -90,7 +90,6 @@ void queue_task(TaskQueue *queue, Task *t){
     tasks_remaining++;
     num_queued_tasks++;
 
-    
     pthread_cond_signal(&queue->condition); // Signal that a new task has been queued
     pthread_mutex_unlock(&queue->mutex); // Unlock mutex
 }
@@ -110,7 +109,6 @@ void queue_task_at(TaskQueue *queue, Task *t, int index){
         queue->rear = index % queue->capacity;
     }
     queue->count++;
-    pthread_cond_signal(&queue->condition); // Signal that a new task has been queued
     pthread_mutex_unlock(&queue->mutex); // Unlock mutex
 }
 
@@ -126,10 +124,11 @@ Task* dequeue_task(TaskQueue *queue){
     //      if either is false (there is a task or thread should stop), keep mutex locked and handle the retrieval of a task
     //      if they are still true (no tasks and still running) then we give back up the mutex and keep waiting
     while(queue->count == 0 && !stop_running){
-        pthread_cond_wait(&task_queue->condition, &task_queue->mutex);
+        pthread_cond_wait(&queue->condition, &queue->mutex);
     }
     // If signaled to stop and queue is still empty
     if(stop_running && queue->count == 0){
+        pthread_cond_signal(&queue->condition); // Send signal to next
         pthread_mutex_unlock(&queue->mutex); // Unlock the mutex before stopping so other threads can stop
         return NULL;
     }
@@ -165,6 +164,7 @@ void *worker_thread(void* arg){
 
         // If no more tasks, exit thread
         if(t == NULL){
+            pthread_cond_signal(&queue->condition);
             break;
         }
 
@@ -172,6 +172,7 @@ void *worker_thread(void* arg){
         int len = 0;
         char cur = '\0';
 
+        // allocate a buffer to store result
         t->result = malloc(BUFFER_SIZE);
 
         // DO THE ENCODING HERE
@@ -199,12 +200,13 @@ void *worker_thread(void* arg){
 
         // Queue task in order
         queue_task_at(completed_queue, t, (t->start)/4096);
+        
 
         // Wait for mutex and then signal that a task is finished
         // then let another task use the lock
         pthread_mutex_lock(&queue->mutex);
         tasks_remaining--;
-        pthread_cond_signal(&queue->condition);
+        pthread_cond_broadcast(&queue->condition); // signal to all that it is unlocked, that way the main thread has a chance to intercept the signal and check if num_tasks is 0
         pthread_mutex_unlock(&queue->mutex);
     }
     return NULL;
@@ -224,6 +226,12 @@ void exit_threads(void){
     pthread_mutex_unlock(&task_queue->mutex); // unblock the mutex
 }
 
+void unexit_threads(void){
+    pthread_mutex_lock(&task_queue->mutex); // lock to change shared memory
+    stop_running = 0; // set stop_running to 1 (stop signal)
+    pthread_cond_broadcast(&task_queue->condition); // signal to ALL waiting on condition
+    pthread_mutex_unlock(&task_queue->mutex); // unblock the mutex
+}
 
 
 void join_threads(void){
@@ -253,14 +261,20 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // CREATE THREADS
-    // CREATE AN EMPTY TASK QUEUE TO STORE TASKS
-    task_queue = create_task_queue(400);
-    create_threads(num_thread);
-    completed_queue = create_task_queue(400);
-    
+
+
+    // save an empty task for writing out
+    // this is the last task of the last file (null if this is the first file)
+    Task *prev_task = NULL;
+    int was_stitched = 0;
     for(int file_index = optind; file_index < argc; file_index++){
-        printf("openafile\n");
+        // reset number of tasks total;
+        num_queued_tasks = 0;
+        // CREATE AN EMPTY TASK QUEUE TO STORE TASKS
+        task_queue = create_task_queue(400);
+        completed_queue = create_task_queue(400);
+        // open files and create new threads
+        create_threads(num_thread);
         int fd = open(argv[file_index], O_RDONLY);
         if(fd == -1){
             fprintf(stderr, "Error: unable to open file\n");
@@ -292,6 +306,9 @@ int main(int argc, char *argv[]) {
             t->addr = addr;
             queue_task(task_queue, t);
         }
+
+
+        
         
         // wait for tasks remaining to be 0
         // must use mutex and cond because this is reading the shared tasks_remaining variable
@@ -303,11 +320,14 @@ int main(int argc, char *argv[]) {
         }
         pthread_mutex_unlock(&task_queue->mutex);
         
-        Task *prev_task = NULL;
-        int was_stitched = 0;
+
+        // if tasks are done, close the threads
+        exit_threads(); // call to make dequeue task return null so the current waiting threads die
+        join_threads(); // join the current threads
+        unexit_threads(); // undo the exit command so we can dequeue from the completed tasks
+
         for(int i = 0; i < num_queued_tasks; i++){
             Task *cur_task = dequeue_task(completed_queue);
-
             if(prev_task != NULL){
                 // If the first and last chars are the same, stitch the count
                 if(prev_task->last_char == cur_task->result[0]){
@@ -335,18 +355,16 @@ int main(int argc, char *argv[]) {
             // move to next task
             prev_task = cur_task;
         }
-        // Print the last task’s result after the loop to ensure it’s output
-        if (prev_task != NULL) {
-            write(STDOUT_FILENO, prev_task->result + was_stitched, prev_task->result_len - was_stitched);
-        }
-        
+
         if(munmap(addr, sb.st_size) == -1){
             fprintf(stderr, "Error: unable to unmap file");
             return 1;
         }
 
     }
-    exit_threads();
-    join_threads();
+    // Print the last task’s result after the loop to ensure the last segment is written
+    if (prev_task != NULL) {
+        write(STDOUT_FILENO, prev_task->result + was_stitched, prev_task->result_len - was_stitched);
+    }
     return 0;
 }
