@@ -9,7 +9,7 @@
 #include <pthread.h>
 
 
-#define BUFFER_SIZE 256
+#define BUFFER_SIZE 1024
 #define BYTES_PER_LINE 16
 #define DEFAULT_THREADS 1
 #define CHUNK_SIZE 4096
@@ -19,23 +19,31 @@
 typedef struct {
     size_t start; // Start byte of the chunk
     size_t end; // End byte of the chunk
-    char **addr; // address of the chunk
-    char **result; // encoded result of the chunk
+    char *addr; // address of the chunk
+    char *result; // encoded result of the chunk
+    size_t result_len; // length in bytes of the encoded result
+    char last_char; // last char of encoded result
+    unsigned int last_count; // last count of encoded char
 } Task;
 
 typedef struct{
     Task **tasks; // Array of pointers to tasks
     int front, rear, count; // Initialize variables for accessing queue data
     int capacity; // Initial capacity of queue which will be increased if necessary
-    pthread_cond_t condition; // Condition variable for the queue
+    pthread_cond_t condition; // Condidtion variable to block a thread when queue is empty allowing other tasks to be queued
     pthread_mutex_t mutex; // Mutex for locking access
 } TaskQueue;
 
 
 int num_thread = DEFAULT_THREADS; // Global num_thread variable
 pthread_t *threads; // Array of working threads in pool
-TaskQueue *task_queue;
-int tasks_remaining = 0;
+TaskQueue *task_queue; // Create a global task queue
+TaskQueue *completed_queue; // Create a global completed queue
+int num_queued_tasks = 0; // Total tasks created
+int tasks_remaining = 0; // Count of tasks remaining. Used for tracking in main thread and joining in order
+
+volatile int stop_running = 0; // Flag to stop threads 
+volatile int pause_running = 0; // Flag to pause threads 
 
 void encode(struct stat sb, char *addr, char *buffer, char *cur, int *len, unsigned int *count){
     for(size_t i = 0; i < (size_t)sb.st_size; i++){
@@ -53,12 +61,7 @@ void encode(struct stat sb, char *addr, char *buffer, char *cur, int *len, unsig
         }
     }
 }
-void create_threads(int num_thread){
-    threads = malloc(sizeof(pthread_t) * num_thread);
-    for( int i = 0; i < num_thread; i++){
-        // pthread_create(&threads[i], NULL, WORKER_THREAD_FUNCTION, NULL)
-    }
-}
+
 void resize_task_queue(TaskQueue *queue){
     queue->capacity = 2*queue->capacity;
     // Increase task size
@@ -73,7 +76,7 @@ void resize_task_queue(TaskQueue *queue){
 void queue_task(TaskQueue *queue, Task *t){
     // Lock mutex
     pthread_mutex_lock(&queue->mutex);
-
+    // if at max capacity resize the queue
     if(queue->count == queue->capacity){
         resize_task_queue(queue);
     }
@@ -82,27 +85,67 @@ void queue_task(TaskQueue *queue, Task *t){
     // // Increase rear counter by 1 and account for overflow of capacity
     queue->rear = (queue->rear+1) % queue->capacity;
     queue->count++;
+
+    // If it is a new task (not completed) add to task remaining and num
     tasks_remaining++;
+    num_queued_tasks++;
+
+    
     pthread_cond_signal(&queue->condition); // Signal that a new task has been queued
     pthread_mutex_unlock(&queue->mutex); // Unlock mutex
 }
 
-Task *dequeue_task(TaskQueue *queue){
+// Adds task to the task queue at specified index
+void queue_task_at(TaskQueue *queue, Task *t, int index){
     // Lock mutex
     pthread_mutex_lock(&queue->mutex);
-    // Wait while count is 0
-    while(queue->count == 0){
+    // if at max capacity resize the queue
+    if(queue->count == queue->capacity || index >= queue->capacity){
+        resize_task_queue(queue);
+    }
+    // add task to end of queue
+    queue->tasks[index] = t;
+    // Increase rear counter by 1 and account for overflow of capacity
+    if(index >= queue->rear){
+        queue->rear = index % queue->capacity;
+    }
+    queue->count++;
+    pthread_cond_signal(&queue->condition); // Signal that a new task has been queued
+    pthread_mutex_unlock(&queue->mutex); // Unlock mutex
+}
+
+// Takes a task off of the queue
+Task* dequeue_task(TaskQueue *queue){
+    // Lock mutex
+    pthread_mutex_lock(&queue->mutex);
+
+    // Wait while count is 0 and not stopping threads
+    // if not for wait, we could immediately try to access the queue which may be empty
+    // so we use wait to give up access to the mutex
+    // when we recieve signal on the cond, go to top of while loop, check if the count is not zero or thread has been signaled to stop
+    //      if either is false (there is a task or thread should stop), keep mutex locked and handle the retrieval of a task
+    //      if they are still true (no tasks and still running) then we give back up the mutex and keep waiting
+    while(queue->count == 0 && !stop_running){
         pthread_cond_wait(&task_queue->condition, &task_queue->mutex);
     }
+    // If signaled to stop and queue is still empty
+    if(stop_running && queue->count == 0){
+        pthread_mutex_unlock(&queue->mutex); // Unlock the mutex before stopping so other threads can stop
+        return NULL;
+    }
+    // otherwise queue must not be empty, return task
     Task *task = queue->tasks[queue->front];
-    queue->front = (queue->front+1) % queue->capacity;
-    queue->count--;
-    pthread_mutex_unlock(&queue->mutex);
+    queue->front = (queue->front+1) % queue->capacity; // move front to next task
+    queue->count--; // decrease count
+
+    // Because this is consuming, we do not need to signal
+    // the signal is only to block a thread when the queue is empty
+    pthread_mutex_unlock(&queue->mutex); // unlock queue mutex
     return task;
 }
 
 // Initializes a task queue and returns it
-TaskQueue* create_thread_queue(int initial_capacity){
+TaskQueue* create_task_queue(int initial_capacity){
     TaskQueue *queue = malloc(sizeof(TaskQueue));
     queue->count = queue->front = queue->rear = 0; // Initialize the vars to 0
     queue->capacity = initial_capacity;
@@ -112,36 +155,87 @@ TaskQueue* create_thread_queue(int initial_capacity){
     return queue;
 }
 
-void worker_thread(){
-    printf("hi im%d", pthread_self());
+void *worker_thread(void* arg){
+    // cast arg to the task queue
+    TaskQueue *queue = (TaskQueue *)arg;  
+    
     // Continue to take tasks and encode them
     while(1){
-        Task *t = dequeue_task(task_queue);
+        Task *t = dequeue_task(queue);
+
+        // If no more tasks, exit thread
+        if(t == NULL){
+            break;
+        }
+
         unsigned int count = 0;
         int len = 0;
         char cur = '\0';
 
+        t->result = malloc(BUFFER_SIZE);
+
         // DO THE ENCODING HERE
+        for(size_t i = t->start; i < t->end; i++){
+            if(i==t->start){
+                // If the beginning of the file, set first char
+                cur = (t->addr)[i];
+                count = 1;
+            }else if(cur != (t->addr)[i]){ // if encounted a new character
+                // create encoding of the last chars
+                len += snprintf((t->result)+len, BUFFER_SIZE-len, "%c%c", (unsigned char) cur, count);
+                cur = (t->addr)[i]; // change cur to the next address
+                count = 1; // reset count
+            }else{
+                count +=1; // if duplicate char, add to count
+            }
+        }
 
-        pthread_mutex_lock(&task_queue->mutex);
+        len += snprintf((t->result)+len, BUFFER_SIZE-len, "%c%c", (unsigned char) cur, count);
+
+        // add the byte length to result_len for printing
+        t->last_char = cur;
+        t->last_count = count;
+        t->result_len = len;
+
+        // Queue task in order
+        queue_task_at(completed_queue, t, (t->start)/4096);
+
+        // Wait for mutex and then signal that a task is finished
+        // then let another task use the lock
+        pthread_mutex_lock(&queue->mutex);
         tasks_remaining--;
-        pthread_cond_signal(&task_queue->condition);
-        pthread_mutex_unlock(&task_queue->mutex);
+        pthread_cond_signal(&queue->condition);
+        pthread_mutex_unlock(&queue->mutex);
     }
-
+    return NULL;
 }
 
 void create_threads(int num){
-    
     threads = malloc(sizeof(pthread_t) * num);
     for(int i = 0; i < num; i++ ){
-        pthread_create(&threads[i], NULL, worker_thread, NULL);
+        pthread_create(&threads[i], NULL, worker_thread, (void *)task_queue);
     }
+}
+// signal to threads to exit
+void exit_threads(void){
+    pthread_mutex_lock(&task_queue->mutex); // lock to change shared memory
+    stop_running = 1; // set stop_running to 1 (stop signal)
+    pthread_cond_broadcast(&task_queue->condition); // signal to ALL waiting on condition
+    pthread_mutex_unlock(&task_queue->mutex); // unblock the mutex
+}
 
+
+
+void join_threads(void){
+    for(int i = 0; i < num_thread; i++){
+        pthread_join(threads[i], NULL);
+    }
+    free(threads);
 }
 
 int main(int argc, char *argv[]) {
     int opt;
+    
     while((opt = getopt(argc, argv, "j:")) != -1){
         switch(opt){
             case 'j':
@@ -153,17 +247,20 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // if no arguments are specified, error
     if(optind >= argc){
         fprintf(stderr, "Error: no files specified\n");
+        return 1;
     }
-
+    
     // CREATE THREADS
     // CREATE AN EMPTY TASK QUEUE TO STORE TASKS
-    task_queue = create_thread_queue(100);
+    task_queue = create_task_queue(400);
     create_threads(num_thread);
-
-
+    completed_queue = create_task_queue(400);
+    
     for(int file_index = optind; file_index < argc; file_index++){
+        printf("openafile\n");
         int fd = open(argv[file_index], O_RDONLY);
         if(fd == -1){
             fprintf(stderr, "Error: unable to open file\n");
@@ -175,108 +272,81 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: unable to access file\n");
             return 1;
         }
-        // Map file into memory
+
+        // Map file into memory of size sb.st_size (the full file)
         char *addr = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (addr == MAP_FAILED){
-            fprintf(stderr, "Error: unable to read file");
+            fprintf(stderr, "Error: unable to read file\n");
             close(fd);
             return 1;
         }
 
         // Create 4kb task structs
         for(int i = 0; i < sb.st_size; i+=CHUNK_SIZE){
-            
             Task *t = malloc(sizeof(Task));
             t->start = i;
             // End of the chunk points to either 4kb from start(i)
             //     or the end of file if the end is less than 4kb
             t->end = (i+CHUNK_SIZE > sb.st_size) ? sb.st_size : i+CHUNK_SIZE;
-            t->addr = &addr;
+            // Passing the pointer of the start of the address to new Task
+            t->addr = addr;
             queue_task(task_queue, t);
-        } 
+        }
         
         // wait for tasks remaining to be 0
         // must use mutex and cond because this is reading the shared tasks_remaining variable
+        // the last thread will send a signal whenever it finishes a task
+        // when this recieves the cond signal, it will check if tasks remaining is 0, if so, begin writing
         pthread_mutex_lock(&task_queue->mutex);
         while(tasks_remaining > 0){
             pthread_cond_wait(&task_queue->condition, &task_queue->mutex);
         }
         pthread_mutex_unlock(&task_queue->mutex);
+        
+        Task *prev_task = NULL;
+        int was_stitched = 0;
+        for(int i = 0; i < num_queued_tasks; i++){
+            Task *cur_task = dequeue_task(completed_queue);
 
+            if(prev_task != NULL){
+                // If the first and last chars are the same, stitch the count
+                if(prev_task->last_char == cur_task->result[0]){
+                    char combined_count[4];
+
+                    // get the count of the current task
+                    unsigned int cur_count = cur_task->result[1];
+                    // combine the last (prev) task's count with the next (cur) task count
+                    snprintf(combined_count, sizeof(combined_count), "%c", (prev_task->last_count + cur_count));
+
+                    // print the previous result minus the last count number
+                    write(STDOUT_FILENO, prev_task->result + was_stitched, prev_task->result_len-(1+was_stitched));
+                    // write the combined count of the last char
+                    write(STDOUT_FILENO, combined_count, strlen(combined_count));
+                    // remove the stitched encoding of the next (cur) chunk
+                    // if this cur_task was stitched, skip over the first 2 encoded chars
+                    was_stitched = 2;
+                }
+                // If chars don't match, just print last section
+                else{
+                    write(STDOUT_FILENO, prev_task->result + was_stitched, prev_task->result_len - was_stitched);
+                    was_stitched = 0;
+                }
+            }
+            // move to next task
+            prev_task = cur_task;
+        }
+        // Print the last task’s result after the loop to ensure it’s output
+        if (prev_task != NULL) {
+            write(STDOUT_FILENO, prev_task->result + was_stitched, prev_task->result_len - was_stitched);
+        }
+        
         if(munmap(addr, sb.st_size) == -1){
             fprintf(stderr, "Error: unable to unmap file");
             return 1;
         }
+
     }
-    // 1. Create an empty task queue
-    // 2. Create thread pool 
-    //      2.1. Worker program waits for tasks to be added
-    // 3. Loop over files
-    //      3.1. For each file, break into 4kb from mmap
-    //      3.2. Create new task for every partition
-    //      3.3. Create a new task with map address, start => i, end=> i+chunksize or sb.st_size if shorter than i+chunksize
-    //      3.4. increment tasks remaining
-    // 4. Queue task
-    //      4.1. Lock queue mutex
-    //      4.2. Add task at rear of queue and increment rear by 1 (watch out for overflow of capacity)
-    //          4.2.1. Increase queue capacity if necessary (realloc)
-    //      4.3. increase count in queue
-    //      4.4. add one to task remaining count
-    //      4.5. send cond signal
-    //      4.6. send mutex unlock
-    // 5. worker thread 
-    //      5.1. mutex lock and wait on cond
-    //      5.2. get task from front of queue, increment front of queue
-    //      5.3. subtract from overall queue count
-    //      5.4. get freshly removed task
-    //      5.4. unlock mutex and perform encoding on task
-    //      5.5. lock mutex and cond and decrement remaining tasks count
-    // 6. wait in main for remaining tasks to be 0 in a mutex lock loop
-    //      6.1. unmap file and wait for next file to come thru
-    //       The condition variable allows the main thread to wait efficiently until tasks_remaining reaches zero. Worker threads signal the condition variable each time they complete a task and decrement tasks_remaining. This signaling wakes up the main thread, which checks if all tasks are done.
-    // 7. join threads and destroy task queue
-
-    // char cur = '\0';
-    // unsigned int count = 0;
-    // char buffer[BUFFER_SIZE];
-    // int len = 0;
-    // if(argc < 2){
-    //     fprintf(stderr, "Error: incorrect input\n");
-    //     return 1;
-    // }
-    // for(int i = 1; i < argc; i++){
-    //     int fd = open(argv[i], O_RDONLY);
-    //     if(fd == -1){
-    //         fprintf(stderr, "Error: unable to open file\n");
-    //         return 1;
-    //     }
-
-    //     // Get fd information
-        // struct stat sb;
-        // if(fstat(fd, &sb) == -1){
-        //     fprintf(stderr, "Error: unable to access file\n");
-        //     return 1;
-        // }
-        // // Map file into memory
-        // char *addr = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        // if (addr == MAP_FAILED){
-        //     fprintf(stderr, "Error: unable to read file");
-        //     close(fd);
-        //     return 1;
-        // }
-    //     // Close input file descriptor after mmaping to memory
-    //     close(fd);
-        
-    //     encode(sb, addr, buffer, &cur, &len, &count);
-        
-
-    //     if(munmap(addr, sb.st_size) == -1){
-    //         fprintf(stderr, "Error: unable to unmap file");
-    //         return 1;
-    //     }
-    // }
-    // len = snprintf(buffer, sizeof(buffer)-len, "%c%c", (unsigned char) cur, count);
-    // write(STDOUT_FILENO, buffer, len);
-
+    exit_threads();
+    join_threads();
     return 0;
 }
